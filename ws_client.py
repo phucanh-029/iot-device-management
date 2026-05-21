@@ -4,6 +4,8 @@ from typing import Callable, Optional
 
 from websocket import WebSocketApp
 
+from utilities import HandshakeValidator
+
 
 class WebSocketManager:
     def __init__(
@@ -11,6 +13,7 @@ class WebSocketManager:
         logger,
         on_message: Optional[Callable[[str], None]] = None,
         on_status_change: Optional[Callable[[bool], None]] = None,
+        auto_handshake: bool = True,
     ) -> None:
         self.logger = logger
         self.on_message = on_message
@@ -18,8 +21,18 @@ class WebSocketManager:
         self.ws_app = None
         self.ws_thread = None
         self.connected = False
+        self.auto_handshake = auto_handshake
+        self.handshake_payload: Optional[dict] = None
 
-    def connect(self, ws_url: str) -> None:
+    def connect(self, ws_url: str, handshake_payload: Optional[dict] = None) -> None:
+        """
+        Connect to WebSocket server.
+        
+        Args:
+            ws_url: WebSocket URL to connect to
+            handshake_payload: Optional handshake payload to send on connection.
+                              If None and auto_handshake=True, default handshake is used.
+        """
         if self.connected:
             self.logger.log("WebSocket is already connected.")
             return
@@ -28,6 +41,7 @@ class WebSocketManager:
             self.logger.log("WebSocket URL is empty.")
             return
 
+        self.handshake_payload = handshake_payload
         self.logger.log(f"Connecting to WebSocket: {ws_url}")
 
         def run_ws() -> None:
@@ -77,12 +91,43 @@ class WebSocketManager:
     def _on_open(self, _ws) -> None:
         self._set_connected(True)
         self.logger.log("WebSocket connected.")
+        
+        # Auto-send handshake if enabled
+        if self.auto_handshake:
+            self._send_handshake()
+
+    def _send_handshake(self) -> None:
+        """Send handshake message after successful connection."""
+        if self.handshake_payload is None:
+            # Use default handshake
+            self.handshake_payload = HandshakeValidator.get_default_handshake()
+        
+        # Validate handshake payload
+        is_valid, error_msg = HandshakeValidator.validate(self.handshake_payload)
+        if not is_valid:
+            self.logger.log(f"Handshake validation failed: {error_msg}")
+            return
+        
+        # Send the handshake
+        self.logger.log(f"Sending handshake message: {json.dumps(self.handshake_payload)}")
+        self.send_json(self.handshake_payload)
 
     def _on_message(self, _ws, message: str) -> None:
-        if self.on_message:
-            self.on_message(message)
-        else:
-            self.logger.log(f"WebSocket received: {message}")
+        # Log handshake responses specially
+        try:
+            msg_obj = json.loads(message)
+            if msg_obj.get("action") == "handshake" or "handshake" in message.lower():
+                self.logger.log(f"Handshake response received: {message}")
+            elif self.on_message:
+                self.on_message(message)
+            else:
+                self.logger.log(f"WebSocket received: {message}")
+        except (json.JSONDecodeError, AttributeError):
+            # Not JSON or can't parse, use default handler
+            if self.on_message:
+                self.on_message(message)
+            else:
+                self.logger.log(f"WebSocket received: {message}")
 
     def _on_error(self, _ws, error) -> None:
         self.logger.log(f"WebSocket error: {error}")

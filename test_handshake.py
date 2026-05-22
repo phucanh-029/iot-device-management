@@ -3,302 +3,235 @@ Test suite for handshake functionality (SCRUM-55)
 
 Tests cover:
 - Handshake message structure validation
-- Default handshake generation
+- Handshake payload building
 - WebSocket auto-handshake on connection
-- Handshake response logging
+- Handshake response validation and logging
 """
 
 import json
+import socket
 import unittest
 from unittest.mock import Mock, patch, MagicMock, call
-from datetime import datetime
+from datetime import datetime, timezone
 
-from utilities import HandshakeValidator, DEFAULT_COMMANDS, AppLogger
+from utilities import DEFAULT_COMMANDS
 from ws_client import WebSocketManager
 
 
-class TestHandshakeValidator(unittest.TestCase):
-    """Tests for HandshakeValidator class."""
-
-    def test_valid_handshake(self):
-        """Test validation of a valid handshake payload."""
-        payload = {
-            "action": "handshake",
-            "clientId": "test-client-001",
-            "token": "valid-token-123",
-            "version": "1.0",
-            "timestamp": "2026-03-27T12:00:00Z"
-        }
-        is_valid, error_msg = HandshakeValidator.validate(payload)
-        self.assertTrue(is_valid)
-        self.assertIsNone(error_msg)
-
-    def test_missing_action(self):
-        """Test validation fails when action field is missing."""
-        payload = {
-            "clientId": "test-client-001",
-            "token": "valid-token-123",
-        }
-        is_valid, error_msg = HandshakeValidator.validate(payload)
-        self.assertFalse(is_valid)
-        self.assertIn("action", error_msg.lower())
-
-    def test_wrong_action(self):
-        """Test validation fails when action is not 'handshake'."""
-        payload = {
-            "action": "ping",
-            "clientId": "test-client-001",
-            "token": "valid-token-123",
-        }
-        is_valid, error_msg = HandshakeValidator.validate(payload)
-        self.assertFalse(is_valid)
-        self.assertIn("handshake", error_msg.lower())
-
-    def test_missing_clientId(self):
-        """Test validation fails when clientId is missing."""
-        payload = {
-            "action": "handshake",
-            "token": "valid-token-123",
-        }
-        is_valid, error_msg = HandshakeValidator.validate(payload)
-        self.assertFalse(is_valid)
-        self.assertIn("clientId", error_msg)
-
-    def test_missing_token(self):
-        """Test validation fails when token is missing."""
-        payload = {
-            "action": "handshake",
-            "clientId": "test-client-001",
-        }
-        is_valid, error_msg = HandshakeValidator.validate(payload)
-        self.assertFalse(is_valid)
-        self.assertIn("token", error_msg)
-
-    def test_empty_clientId(self):
-        """Test validation fails when clientId is empty."""
-        payload = {
-            "action": "handshake",
-            "clientId": "",
-            "token": "valid-token-123",
-        }
-        is_valid, error_msg = HandshakeValidator.validate(payload)
-        self.assertFalse(is_valid)
-        self.assertIn("clientId", error_msg)
-
-    def test_short_clientId(self):
-        """Test validation fails when clientId is too short."""
-        payload = {
-            "action": "handshake",
-            "clientId": "ab",  # Less than 3 chars
-            "token": "valid-token-123",
-        }
-        is_valid, error_msg = HandshakeValidator.validate(payload)
-        self.assertFalse(is_valid)
-        self.assertIn("clientId", error_msg)
-
-    def test_placeholder_token(self):
-        """Test validation fails when token is 'replace-me' placeholder."""
-        payload = {
-            "action": "handshake",
-            "clientId": "test-client-001",
-            "token": "replace-me",
-        }
-        is_valid, error_msg = HandshakeValidator.validate(payload)
-        self.assertFalse(is_valid)
-        self.assertIn("configured", error_msg.lower())
-
-    def test_non_dict_payload(self):
-        """Test validation fails when payload is not a dict."""
-        payload = "not a dict"
-        is_valid, error_msg = HandshakeValidator.validate(payload)
-        self.assertFalse(is_valid)
-        self.assertIn("dictionary", error_msg)
-
-    def test_get_default_handshake(self):
-        """Test generating default handshake payload."""
-        handshake = HandshakeValidator.get_default_handshake(
-            client_id="my-client",
-            token="my-token"
-        )
-        self.assertEqual(handshake["action"], "handshake")
-        self.assertEqual(handshake["clientId"], "my-client")
-        self.assertEqual(handshake["token"], "my-token")
-        self.assertEqual(handshake["version"], "1.0")
-        self.assertIn("timestamp", handshake)
-
-    def test_get_default_handshake_custom_args(self):
-        """Test default handshake with custom client ID."""
-        handshake = HandshakeValidator.get_default_handshake(
-            client_id="custom-device-123"
-        )
-        self.assertEqual(handshake["clientId"], "custom-device-123")
-
-
-class TestDefaultCommandsHandshake(unittest.TestCase):
-    """Tests for handshake in DEFAULT_COMMANDS."""
-
-    def test_handshake_in_defaults(self):
-        """Test that handshake is in DEFAULT_COMMANDS."""
-        handshake_cmd = DEFAULT_COMMANDS[0]
-        self.assertEqual(handshake_cmd["name"], "Handshake")
-        self.assertEqual(handshake_cmd["payload"]["action"], "handshake")
-
-    def test_handshake_has_required_fields(self):
-        """Test that default handshake has all required fields."""
-        payload = DEFAULT_COMMANDS[0]["payload"]
-        required_fields = ["action", "clientId", "token"]
-        for field in required_fields:
-            self.assertIn(field, payload)
-
-    def test_handshake_is_first_command(self):
-        """Test that handshake is the first default command."""
-        self.assertEqual(DEFAULT_COMMANDS[0]["name"], "Handshake")
-
-
-class TestWebSocketHandshakeIntegration(unittest.TestCase):
-    """Tests for WebSocket manager handshake integration."""
+class TestHandshakePayloadBuilder(unittest.TestCase):
+    """Tests for handshake payload building."""
 
     def setUp(self):
         """Set up test fixtures."""
         self.mock_logger = Mock()
-        self.messages = []
+        self.ws_manager = WebSocketManager(logger=self.mock_logger)
 
-    def test_websocket_manager_initialization(self):
-        """Test WebSocketManager initializes with auto_handshake enabled."""
-        manager = WebSocketManager(
-            logger=self.mock_logger,
-            auto_handshake=True
-        )
-        self.assertTrue(manager.auto_handshake)
-        self.assertIsNone(manager.handshake_payload)
+    def test_build_handshake_payload_structure(self):
+        """Test that handshake payload has all required fields."""
+        payload = self.ws_manager._build_handshake_payload()
+        
+        required_fields = [
+            "message_type",
+            "client_id", 
+            "protocol_version",
+            "timestamp",
+            "device_name",
+            "capabilities",
+        ]
+        for field in required_fields:
+            self.assertIn(field, payload, f"Field '{field}' missing from handshake payload")
 
-    def test_websocket_manager_can_disable_auto_handshake(self):
-        """Test WebSocketManager can disable auto_handshake."""
-        manager = WebSocketManager(
-            logger=self.mock_logger,
-            auto_handshake=False
-        )
-        self.assertFalse(manager.auto_handshake)
+    def test_handshake_message_type(self):
+        """Test that message_type is 'handshake'."""
+        payload = self.ws_manager._build_handshake_payload()
+        self.assertEqual(payload["message_type"], "handshake")
 
-    def test_handshake_sent_on_connection(self):
-        """Test that handshake is sent when WebSocket opens."""
-        mock_logger = Mock()
-        manager = WebSocketManager(
-            logger=mock_logger,
-            auto_handshake=True
-        )
-        
-        # Manually trigger the on_open callback
-        manager.connected = False
-        manager.ws_app = MagicMock()
-        manager._on_open(None)
-        
-        # Verify the state changed
-        self.assertTrue(manager.connected)
-        # Logger should have been called
-        self.assertGreater(mock_logger.log.call_count, 0)
+    def test_handshake_client_id_from_hostname(self):
+        """Test that client_id uses socket.gethostname()."""
+        payload = self.ws_manager._build_handshake_payload()
+        self.assertEqual(payload["client_id"], socket.gethostname())
 
-    def test_handshake_validation_before_send(self):
-        """Test that handshake is validated before sending."""
-        logger_callback = Mock()
-        app_logger = AppLogger(logger_callback)
-        manager = WebSocketManager(
-            logger=app_logger,
-            auto_handshake=True
-        )
-        
-        # Set invalid handshake payload (replace-me token)
-        manager.handshake_payload = {
-            "action": "handshake",
-            "clientId": "test-client",
-            "token": "replace-me"
-        }
-        
-        manager.connected = True
-        manager.ws_app = MagicMock()
-        
-        # Try to send invalid handshake
-        manager._send_handshake()
-        
-        # Should log validation error
-        self.assertGreater(logger_callback.call_count, 0)
+    def test_handshake_protocol_version(self):
+        """Test that protocol_version is '1.0'."""
+        payload = self.ws_manager._build_handshake_payload()
+        self.assertEqual(payload["protocol_version"], "1.0")
 
-    def test_handshake_response_logging(self):
-        """Test that handshake responses are logged."""
-        logger_callback = Mock()
-        app_logger = AppLogger(logger_callback)
-        manager = WebSocketManager(logger=app_logger)
-        
-        # Simulate receiving a handshake response
-        response_msg = json.dumps({
-            "action": "handshake",
-            "status": "accepted",
-            "sessionId": "sess-123"
-        })
-        
-        manager._on_message(None, response_msg)
-        
-        # Should log handshake response
-        self.assertGreater(logger_callback.call_count, 0)
+    def test_handshake_device_name(self):
+        """Test that device_name is correct."""
+        payload = self.ws_manager._build_handshake_payload()
+        self.assertEqual(payload["device_name"], "IoT-Device-Client")
 
-    def test_send_json_with_valid_connection(self):
-        """Test sending JSON message via WebSocket."""
-        manager = WebSocketManager(logger=self.mock_logger)
-        manager.connected = True
-        manager.ws_app = MagicMock()
-        
-        payload = {"action": "ping"}
-        manager.send_json(payload)
-        
-        # Verify send was called
-        manager.ws_app.send.assert_called_once()
-
-    def test_default_handshake_generated_on_open(self):
-        """Test default handshake is generated if not provided."""
-        logger_callback = Mock()
-        app_logger = AppLogger(logger_callback)
-        manager = WebSocketManager(
-            logger=app_logger,
-            auto_handshake=True
-        )
-        
-        manager.connected = False
-        manager.ws_app = MagicMock()
-        manager.auto_handshake = True
-        manager.handshake_payload = None
-        
-        manager._on_open(None)
-        
-        # Check that handshake_payload was generated
-        self.assertIsNotNone(manager.handshake_payload)
-        self.assertEqual(manager.handshake_payload["action"], "handshake")
-
-
-class TestHandshakeMessageStructure(unittest.TestCase):
-    """Tests for handshake message structure."""
-
-    def test_handshake_json_structure(self):
-        """Test that handshake message is valid JSON."""
-        handshake = HandshakeValidator.get_default_handshake(
-            client_id="test-device",
-            token="test-token"
-        )
-        # Should be serializable to JSON
-        json_str = json.dumps(handshake)
-        # Should be deserializable from JSON
-        parsed = json.loads(json_str)
-        self.assertEqual(parsed["action"], "handshake")
+    def test_handshake_capabilities_list(self):
+        """Test that capabilities is a list with expected commands."""
+        payload = self.ws_manager._build_handshake_payload()
+        expected_capabilities = ["ping", "login", "subscribe", "echo"]
+        self.assertEqual(payload["capabilities"], expected_capabilities)
 
     def test_handshake_timestamp_format(self):
-        """Test that handshake includes ISO format timestamp."""
-        handshake = HandshakeValidator.get_default_handshake(
-            client_id="test",
-            token="test"
+        """Test that timestamp is ISO 8601 format with 'Z' suffix."""
+        payload = self.ws_manager._build_handshake_payload()
+        timestamp = payload["timestamp"]
+        
+        # Should end with 'Z'
+        self.assertTrue(timestamp.endswith("Z"), f"Timestamp should end with 'Z': {timestamp}")
+        
+        # Should be parseable as ISO 8601
+        try:
+            # Remove 'Z' and parse
+            datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            self.fail(f"Timestamp is not valid ISO 8601: {timestamp}")
+
+
+class TestHandshakeResponseValidation(unittest.TestCase):
+    """Tests for handshake response validation."""
+
+    def setUp(self):
+        """Set up test fixtures."""
+        self.mock_logger = Mock()
+        self.ws_manager = WebSocketManager(logger=self.mock_logger)
+
+    def test_valid_handshake_response(self):
+        """Test validation of a valid handshake response."""
+        payload = {
+            "message_type": "handshake_response",
+            "timestamp": "2026-05-21T14:32:10Z",
+            "status": "ok"
+        }
+        result = self.ws_manager._validate_handshake_response(payload)
+        self.assertTrue(result)
+        self.mock_logger.log.assert_called()
+
+    def test_invalid_response_missing_message_type(self):
+        """Test validation fails when message_type is missing."""
+        payload = {
+            "timestamp": "2026-05-21T14:32:10Z",
+            "status": "ok"
+        }
+        result = self.ws_manager._validate_handshake_response(payload)
+        self.assertFalse(result)
+
+    def test_invalid_response_missing_timestamp(self):
+        """Test validation fails when timestamp is missing."""
+        payload = {
+            "message_type": "handshake_response",
+            "status": "ok"
+        }
+        result = self.ws_manager._validate_handshake_response(payload)
+        self.assertFalse(result)
+
+    def test_invalid_response_wrong_message_type(self):
+        """Test validation fails when message_type is not 'handshake_response'."""
+        payload = {
+            "message_type": "ping_response",
+            "timestamp": "2026-05-21T14:32:10Z",
+            "status": "ok"
+        }
+        result = self.ws_manager._validate_handshake_response(payload)
+        self.assertFalse(result)
+
+    def test_validation_logs_success(self):
+        """Test that successful validation is logged."""
+        payload = {
+            "message_type": "handshake_response",
+            "timestamp": "2026-05-21T14:32:10Z"
+        }
+        self.ws_manager._validate_handshake_response(payload)
+        
+        # Check that logger was called
+        calls = self.mock_logger.log.call_args_list
+        self.assertTrue(any("validated" in str(call) for call in calls))
+
+    def test_validation_logs_failure(self):
+        """Test that failed validation is logged."""
+        payload = {
+            "timestamp": "2026-05-21T14:32:10Z"
+        }
+        self.ws_manager._validate_handshake_response(payload)
+        
+        # Check that logger was called with failure message
+        calls = self.mock_logger.log.call_args_list
+        self.assertTrue(
+            any("validation failed" in str(call).lower() for call in calls),
+            f"Expected validation failure log, got: {calls}"
         )
-        timestamp = handshake.get("timestamp")
-        self.assertIsNotNone(timestamp)
-        # Should end with Z (ISO format)
-        self.assertTrue(timestamp.endswith("Z"))
+
+
+class TestHandshakeInDefaultCommands(unittest.TestCase):
+    """Tests for handshake in default commands list."""
+
+    def test_handshake_in_default_commands(self):
+        """Test that 'Handshake' appears in DEFAULT_COMMANDS."""
+        handshake_cmd = None
+        for cmd in DEFAULT_COMMANDS:
+            if cmd.get("name") == "Handshake":
+                handshake_cmd = cmd
+                break
+        
+        self.assertIsNotNone(handshake_cmd, "Handshake not found in DEFAULT_COMMANDS")
+
+    def test_handshake_command_structure(self):
+        """Test that handshake command has correct structure."""
+        handshake_cmd = None
+        for cmd in DEFAULT_COMMANDS:
+            if cmd.get("name") == "Handshake":
+                handshake_cmd = cmd
+                break
+        
+        self.assertIn("payload", handshake_cmd)
+        payload = handshake_cmd["payload"]
+        
+        expected_fields = [
+            "message_type",
+            "client_id",
+            "protocol_version",
+            "device_name",
+            "capabilities",
+        ]
+        for field in expected_fields:
+            self.assertIn(field, payload, f"Field '{field}' missing from handshake command payload")
+
+    def test_handshake_command_message_type(self):
+        """Test that handshake command has message_type='handshake'."""
+        handshake_cmd = None
+        for cmd in DEFAULT_COMMANDS:
+            if cmd.get("name") == "Handshake":
+                handshake_cmd = cmd
+                break
+        
+        self.assertEqual(handshake_cmd["payload"]["message_type"], "handshake")
+
+
+class TestWebSocketHandshakeIntegration(unittest.TestCase):
+    """Integration tests for WebSocket handshake behavior."""
+
+    def test_handshake_builder_creates_valid_structure(self):
+        """Test that handshake payload builder creates valid structure."""
+        mock_logger = Mock()
+        ws_manager = WebSocketManager(logger=mock_logger)
+        
+        # Build and verify handshake can be created
+        handshake = ws_manager._build_handshake_payload()
+        self.assertIsNotNone(handshake)
+        self.assertEqual(handshake["message_type"], "handshake")
+
+    def test_handshake_send_json_integration(self):
+        """Test that handshake can be sent via send_json()."""
+        mock_logger = Mock()
+        ws_manager = WebSocketManager(logger=mock_logger)
+        
+        # Simulate connected state
+        ws_manager._set_connected(True)
+        
+        # Mock the websocket app
+        ws_manager.ws_app = Mock()
+        
+        # Build and send handshake
+        handshake = ws_manager._build_handshake_payload()
+        ws_manager.send_json(handshake)
+        
+        # Verify send was called
+        ws_manager.ws_app.send.assert_called_once()
 
 
 if __name__ == "__main__":

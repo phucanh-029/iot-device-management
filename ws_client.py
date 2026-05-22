@@ -1,10 +1,10 @@
 import json
+import socket
 import threading
+from datetime import datetime, timezone
 from typing import Callable, Optional
 
 from websocket import WebSocketApp
-
-from utilities import HandshakeValidator
 
 
 class WebSocketManager:
@@ -13,7 +13,6 @@ class WebSocketManager:
         logger,
         on_message: Optional[Callable[[str], None]] = None,
         on_status_change: Optional[Callable[[bool], None]] = None,
-        auto_handshake: bool = True,
     ) -> None:
         self.logger = logger
         self.on_message = on_message
@@ -21,18 +20,8 @@ class WebSocketManager:
         self.ws_app = None
         self.ws_thread = None
         self.connected = False
-        self.auto_handshake = auto_handshake
-        self.handshake_payload: Optional[dict] = None
 
-    def connect(self, ws_url: str, handshake_payload: Optional[dict] = None) -> None:
-        """
-        Connect to WebSocket server.
-        
-        Args:
-            ws_url: WebSocket URL to connect to
-            handshake_payload: Optional handshake payload to send on connection.
-                              If None and auto_handshake=True, default handshake is used.
-        """
+    def connect(self, ws_url: str) -> None:
         if self.connected:
             self.logger.log("WebSocket is already connected.")
             return
@@ -41,7 +30,6 @@ class WebSocketManager:
             self.logger.log("WebSocket URL is empty.")
             return
 
-        self.handshake_payload = handshake_payload
         self.logger.log(f"Connecting to WebSocket: {ws_url}")
 
         def run_ws() -> None:
@@ -88,46 +76,61 @@ class WebSocketManager:
         if self.on_status_change:
             self.on_status_change(value)
 
+    def _build_handshake_payload(self) -> dict:
+        """Build a handshake payload with device metadata."""
+        return {
+            "message_type": "handshake",
+            "client_id": socket.gethostname(),
+            "protocol_version": "1.0",
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "") + "Z",
+            "device_name": "IoT-Device-Client",
+            "capabilities": ["ping", "login", "subscribe", "echo"],
+        }
+
+    def _validate_handshake_response(self, payload: dict) -> bool:
+        """Validate incoming handshake response from server."""
+        required_fields = ["message_type", "timestamp"]
+        if not all(field in payload for field in required_fields):
+            self.logger.log("Handshake response validation failed: missing fields")
+            return False
+        if payload.get("message_type") != "handshake_response":
+            return False
+        self.logger.log(f"Handshake response validated: {payload}")
+        return True
+
     def _on_open(self, _ws) -> None:
         self._set_connected(True)
         self.logger.log("WebSocket connected.")
-        
-        # Auto-send handshake if enabled
-        if self.auto_handshake:
-            self._send_handshake()
 
-    def _send_handshake(self) -> None:
-        """Send handshake message after successful connection."""
-        if self.handshake_payload is None:
-            # Use default handshake
-            self.handshake_payload = HandshakeValidator.get_default_handshake()
-        
-        # Validate handshake payload
-        is_valid, error_msg = HandshakeValidator.validate(self.handshake_payload)
-        if not is_valid:
-            self.logger.log(f"Handshake validation failed: {error_msg}")
-            return
-        
-        # Send the handshake
-        self.logger.log(f"Sending handshake message: {json.dumps(self.handshake_payload)}")
-        self.send_json(self.handshake_payload)
+        # Send handshake after 100ms delay in a daemon thread
+        def send_handshake_delayed() -> None:
+            threading.Event().wait(0.1)
+            handshake_payload = self._build_handshake_payload()
+            self.send_json(handshake_payload)
+            self.logger.log(f"Handshake message sent: {json.dumps(handshake_payload)}")
+
+        handshake_thread = threading.Thread(target=send_handshake_delayed, daemon=True)
+        handshake_thread.start()
 
     def _on_message(self, _ws, message: str) -> None:
-        # Log handshake responses specially
+        # Detect and validate handshake responses
         try:
             msg_obj = json.loads(message)
-            if msg_obj.get("action") == "handshake" or "handshake" in message.lower():
-                self.logger.log(f"Handshake response received: {message}")
-            elif self.on_message:
-                self.on_message(message)
-            else:
-                self.logger.log(f"WebSocket received: {message}")
-        except (json.JSONDecodeError, AttributeError):
-            # Not JSON or can't parse, use default handler
-            if self.on_message:
-                self.on_message(message)
-            else:
-                self.logger.log(f"WebSocket received: {message}")
+            if msg_obj.get("message_type") == "handshake_response":
+                if self._validate_handshake_response(msg_obj):
+                    if self.on_message:
+                        self.on_message(message)
+                else:
+                    self.logger.log("Handshake response validation failed")
+                return
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+
+        # Handle regular messages
+        if self.on_message:
+            self.on_message(message)
+        else:
+            self.logger.log(f"WebSocket received: {message}")
 
     def _on_error(self, _ws, error) -> None:
         self.logger.log(f"WebSocket error: {error}")

@@ -3,6 +3,17 @@ from datetime import datetime
 
 DEFAULT_COMMANDS = [
     {
+        "name": "Handshake",
+        "payload": {
+            "message_type": "handshake",
+            "client_id": "device-simulator",
+            "protocol_version": "1.0",
+            "timestamp": "2026-05-21T14:32:10Z",
+            "device_name": "IoT-Device-Client",
+            "capabilities": ["ping", "login", "subscribe", "echo"]
+        },
+    },
+    {
         "name": "Ping",
         "payload": {
             "action": "ping",

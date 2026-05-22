@@ -1,5 +1,7 @@
 import json
+import socket
 import threading
+from datetime import datetime, timezone
 from typing import Callable, Optional
 
 from websocket import WebSocketApp
@@ -74,11 +76,57 @@ class WebSocketManager:
         if self.on_status_change:
             self.on_status_change(value)
 
+    def _build_handshake_payload(self) -> dict:
+        """Build a handshake payload with device metadata."""
+        return {
+            "message_type": "handshake",
+            "client_id": socket.gethostname(),
+            "protocol_version": "1.0",
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "") + "Z",
+            "device_name": "IoT-Device-Client",
+            "capabilities": ["ping", "login", "subscribe", "echo"],
+        }
+
+    def _validate_handshake_response(self, payload: dict) -> bool:
+        """Validate incoming handshake response from server."""
+        required_fields = ["message_type", "timestamp"]
+        if not all(field in payload for field in required_fields):
+            self.logger.log("Handshake response validation failed: missing fields")
+            return False
+        if payload.get("message_type") != "handshake_response":
+            return False
+        self.logger.log(f"Handshake response validated: {payload}")
+        return True
+
     def _on_open(self, _ws) -> None:
         self._set_connected(True)
         self.logger.log("WebSocket connected.")
 
+        # Send handshake after 100ms delay in a daemon thread
+        def send_handshake_delayed() -> None:
+            threading.Event().wait(0.1)
+            handshake_payload = self._build_handshake_payload()
+            self.send_json(handshake_payload)
+            self.logger.log(f"Handshake message sent: {json.dumps(handshake_payload)}")
+
+        handshake_thread = threading.Thread(target=send_handshake_delayed, daemon=True)
+        handshake_thread.start()
+
     def _on_message(self, _ws, message: str) -> None:
+        # Detect and validate handshake responses
+        try:
+            msg_obj = json.loads(message)
+            if msg_obj.get("message_type") == "handshake_response":
+                if self._validate_handshake_response(msg_obj):
+                    if self.on_message:
+                        self.on_message(message)
+                else:
+                    self.logger.log("Handshake response validation failed")
+                return
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+
+        # Handle regular messages
         if self.on_message:
             self.on_message(message)
         else:
